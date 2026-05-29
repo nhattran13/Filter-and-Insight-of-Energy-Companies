@@ -1,9 +1,0 @@
-.env
-*.pdf
-uv.lock
-__pycache__/
-pyproject.toml
-README.md
-.python-version
-data_ingestion_test.py
-bsky_search_view.png
