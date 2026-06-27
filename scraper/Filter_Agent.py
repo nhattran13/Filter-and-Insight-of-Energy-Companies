@@ -38,6 +38,7 @@ import pandas as pd
 
 MODEL       = "gemini-3.1-flash-lite"    # change to gemini-1.5-pro for higher accuracy
 BATCH_PAUSE = 6.0                    # seconds between API calls (rate-limit buffer)
+BATCH_SIZE  = 10                     # number of posts sent to the LLM per API call
 
 OUTPUT_FOLDER = "CSV_Files"      # all output CSVs are saved into this folder
 
@@ -52,10 +53,15 @@ COL_AUTHOR = "Author_DID"
 
 REQUIRED_COLUMNS = [COL_CID, COL_DATE, COL_TEXT, COL_SOURCE, COL_AUTHOR]
 
+OUTPUT_COLUMNS = [
+    COL_CID, COL_DATE, COL_TEXT, COL_SOURCE, COL_AUTHOR,
+    "Relevant", "Confidence", "Matched_Topics", "Reasoning",
+]
+
 SYSTEM_PROMPT = """You are a content classifier.
 
-Your task is to decide whether a social-media post is relevant to ANY of
-the following topics:
+You will be given a numbered batch of social-media posts. For EACH post,
+decide whether it is relevant to ANY of the following topics:
   1. The Iran conflict — military operations, diplomacy, sanctions, nuclear
      programme, or Iran's role in
      regional conflicts (Gaza, Lebanon, Yemen, Iraq, Syria).
@@ -63,19 +69,25 @@ the following topics:
      oil/gas prices, LNG, petroleum exports, or market disruptions linked
      to Middle-East tensions.
 
-Return ONLY a JSON object — no markdown fences, no extra text — with
-exactly these keys:
+Return ONLY a JSON array — no markdown fences, no extra text — with one
+object per post, in the SAME ORDER as the input posts. Each object must
+have exactly these keys:
   {
+    "index": <the post number as given in the input>,
     "relevant": true | false,
     "confidence": "high" | "medium" | "low",
     "topics": ["<matched topic label>", ...],
     "reasoning": "<one concise sentence>"
   }
 
-If the post does not clearly relate to any topic above, set relevant to false.
+The output array must contain exactly as many objects as there were posts
+in the input batch. If a post does not clearly relate to any topic above,
+set relevant to false for that post.
 """
 
 USER_TEMPLATE = "Post text:\n{text}"
+
+BATCH_USER_TEMPLATE = "Classify the following {count} posts.\n\n{posts_block}"
 
 
 # ---------------------------------------------------------------------------
@@ -102,15 +114,33 @@ def load_csv(path: str) -> pd.DataFrame:
 # Gemini classifier
 # ---------------------------------------------------------------------------
 
-def classify_post(client: genai.Client, text: str) -> tuple[dict, int, int]:
-    """Send a post to Gemini and return (classification dict, input_tokens, output_tokens)."""
-    if not text.strip():
-        return {
-            "relevant":   False,
-            "confidence": "high",
-            "topics":     [],
-            "reasoning":  "Empty post text — skipped.",
-        }, 0, 0
+def _empty_result(reasoning: str, confidence: str = "low") -> dict:
+    return {
+        "relevant":   False,
+        "confidence": confidence,
+        "topics":     [],
+        "reasoning":  reasoning,
+    }
+
+
+def classify_batch(client: genai.Client, texts: list[str]) -> tuple[list[dict], int, int]:
+    """Send a batch of posts to Gemini and return (list of classification dicts, input_tokens, output_tokens).
+
+    The returned list is always the same length and order as `texts`.
+    Empty-text posts are classified locally (skipped) without using the API.
+    """
+    # Map local batch positions -> texts that actually need to be sent to the model
+    indices_to_send = [i for i, t in enumerate(texts) if t.strip()]
+
+    # All posts in this batch are empty — nothing to send
+    if not indices_to_send:
+        results = [_empty_result("Empty post text — skipped.", "high") for _ in texts]
+        return results, 0, 0
+
+    posts_block = "\n\n".join(
+        f"Post {pos + 1}:\n{texts[pos][:2000]}" for pos in indices_to_send
+    )
+    user_message = BATCH_USER_TEMPLATE.format(count=len(indices_to_send), posts_block=posts_block)
 
     max_retries = 5
     raw = ""
@@ -120,7 +150,7 @@ def classify_post(client: genai.Client, text: str) -> tuple[dict, int, int]:
         try:
             response = client.models.generate_content(
                 model=MODEL,
-                contents=USER_TEMPLATE.format(text=text[:2000]),
+                contents=user_message,
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT,
                 ),
@@ -138,14 +168,11 @@ def classify_post(client: genai.Client, text: str) -> tuple[dict, int, int]:
                     print(f"\n[!] Quota exceeded. Retrying in {wait_time}s... (Attempt {attempt+1}/{max_retries})")
                     time.sleep(wait_time)
                 else:
-                    print("\n[!] Max retries reached. Skipping this post.")
-                    return {
-                        "relevant": False,
-                        "confidence": "low",
-                        "topics": [],
-                        "reasoning": "Quota limit reached after multiple retries."
-                    }, 0, 0
+                    print("\n[!] Max retries reached. Skipping this batch.")
+                    results = [_empty_result("Quota limit reached after multiple retries.") for _ in texts]
+                    return results, 0, 0
             else:
+                # Non-quota error — report it and signal caller to continue
                 raise
 
     # Extract token usage from response metadata
@@ -161,22 +188,44 @@ def classify_post(client: genai.Client, text: str) -> tuple[dict, int, int]:
         if raw.startswith("json"):
             raw = raw[4:]
 
+    # Start with a default "could not parse" result for every post in the batch
+    results = [
+        _empty_result(f"Could not parse model response: {raw[:70]}")
+        for _ in texts
+    ]
+    # Pre-fill empty posts (not sent to the model) with their skip reasoning
+    for i, t in enumerate(texts):
+        if not t.strip():
+            results[i] = _empty_result("Empty post text — skipped.", "high")
+
     try:
-        return json.loads(raw), input_tokens, output_tokens
-    except json.JSONDecodeError:
-        return {
-            "relevant":   False,
-            "confidence": "low",
-            "topics":     [],
-            "reasoning":  f"Could not parse model response: {raw[:120]}",
-        }, input_tokens, output_tokens
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list):
+            raise ValueError("Model response was not a JSON array")
+
+        for item in parsed:
+            idx = item.get("index")
+            if idx is None:
+                continue
+            pos = idx - 1  # convert 1-based "Post N" back to 0-based list position
+            if 0 <= pos < len(texts):
+                results[pos] = {
+                    "relevant":   bool(item.get("relevant", False)),
+                    "confidence": item.get("confidence", ""),
+                    "topics":     item.get("topics", []),
+                    "reasoning":  item.get("reasoning", ""),
+                }
+    except (json.JSONDecodeError, ValueError):
+        pass  # leave the default "could not parse" results in place
+
+    return results, input_tokens, output_tokens
 
 
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def run_agent(input_path: str, output_path: str, limit: int | None, api_key: str = None) -> None:
+def run_agent_filter(input_path: str, output_path: str, limit: int | None, api_key: str = None) -> None:
     # Resolve API key: parameter → environment variable
     key = api_key or os.environ.get("GEMINI_API_KEY")
     if not key or key == "YOUR_GEMINI_API_KEY_HERE":
@@ -198,56 +247,84 @@ def run_agent(input_path: str, output_path: str, limit: int | None, api_key: str
 
     total = len(df)
     relevant_count      = 0
+    error_count         = 0
     total_input_tokens  = 0
     total_output_tokens = 0
 
-    # Classification result columns — pre-filled with defaults
-    relevants   = []
-    confidences = []
-    topics_list = []
-    reasonings  = []
-
-    for i, (_, row) in enumerate(df.iterrows(), start=1):
-        text = row[COL_TEXT]
-        cid  = row[COL_CID]
-
-        print(f"\n[{i}/{total}] {cid[:40]}")
-        print(f"  Text : {text[:90]}{'...' if len(text) > 90 else ''}")
-
-        result, in_tok, out_tok = classify_post(client, text)
-
-        total_input_tokens  += in_tok
-        total_output_tokens += out_tok
-
-        relevants.append(result["relevant"])
-        confidences.append(result.get("confidence", ""))
-        topics_list.append("; ".join(result.get("topics", [])))
-        reasonings.append(result.get("reasoning", ""))
-
-        if result["relevant"]:
-            relevant_count += 1
-            print(f"  RELEVANT  | confidence={result['confidence']}")
-            print(f"  topics    : {'; '.join(result.get('topics', []))}")
-            print(f"  reasoning : {result.get('reasoning', '')}")
-        else:
-            print(f"  not relevant -- {result.get('reasoning', '')[:90]}")
-
-        print(f"  tokens    : {in_tok} in / {out_tok} out")
-
-        time.sleep(BATCH_PAUSE)
-
-    # Append classification columns to the original dataframe
-    df["Relevant"]       = relevants
-    df["Confidence"]     = confidences
-    df["Matched_Topics"] = topics_list
-    df["Reasoning"]      = reasonings
-
     # Ensure output folder exists and resolve full output path
-    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
     final_output_path = os.path.join(OUTPUT_FOLDER, output_path)
+    os.makedirs(os.path.dirname(final_output_path) or ".", exist_ok=True)
 
-    # Write all posts to output CSV
-    df.to_csv(final_output_path, index=False, quoting=csv.QUOTE_ALL, encoding="utf-8")
+    # Open the output CSV once and write rows immediately after each batch is scanned
+    with open(final_output_path, mode="w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=OUTPUT_COLUMNS, quoting=csv.QUOTE_ALL)
+        writer.writeheader()
+
+        rows = list(df.iterrows())  # list of (orig_index, row)
+        num_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+
+        for batch_num in range(num_batches):
+            start = batch_num * BATCH_SIZE
+            end   = min(start + BATCH_SIZE, total)
+            batch_rows = rows[start:end]
+            batch_texts = [row[COL_TEXT] for _, row in batch_rows]
+
+            print(f"\n[Batch {batch_num + 1}/{num_batches}] posts {start + 1}-{end} of {total}")
+            for offset, (_, row) in enumerate(batch_rows):
+                cid  = row[COL_CID]
+                text = row[COL_TEXT]
+                print(f"  ({start + offset + 1}/{total}) {cid[:40]} -- {text[:70]}{'...' if len(text) > 70 else ''}")
+
+            try:
+                results, in_tok, out_tok = classify_batch(client, batch_texts)
+
+            except Exception as e:
+                error_count += len(batch_rows)
+                print(f"  [ERROR] {type(e).__name__}: {e}")
+                print(f"  -> Skipping batch and continuing...")
+                results = [
+                    {
+                        "relevant":   False,
+                        "confidence": "low",
+                        "topics":     [],
+                        "reasoning":  f"Error during classification: {type(e).__name__}: {str(e)[:70]}",
+                    }
+                    for _ in batch_rows
+                ]
+                in_tok  = 0
+                out_tok = 0
+
+            total_input_tokens  += in_tok
+            total_output_tokens += out_tok
+
+            for (_, row), result in zip(batch_rows, results):
+                text = row[COL_TEXT]
+
+                if result["relevant"]:
+                    relevant_count += 1
+                    print(f"  RELEVANT  | {row[COL_CID][:30]:30s} confidence={result['confidence']}")
+                    print(f"      topics    : {'; '.join(result.get('topics', []))}")
+                    print(f"      reasoning : {result.get('reasoning', '')}")
+                else:
+                    print(f"  not relevant | {row[COL_CID][:30]:30s} confidence={result['confidence']}")
+
+                # Write this row immediately to disk — safe even if script crashes
+                writer.writerow({
+                    COL_CID:           row[COL_CID],
+                    COL_DATE:          row[COL_DATE],
+                    COL_TEXT:          text,
+                    COL_SOURCE:        row[COL_SOURCE],
+                    COL_AUTHOR:        row[COL_AUTHOR],
+                    "Relevant":        result["relevant"],
+                    "Confidence":      result.get("confidence", ""),
+                    "Matched_Topics":  "; ".join(result.get("topics", [])),
+                    "Reasoning":       result.get("reasoning", ""),
+                })
+
+            csv_file.flush()  # force write to disk immediately
+            print(f"  tokens    : {in_tok} in / {out_tok} out (batch total)")
+
+            time.sleep(BATCH_PAUSE)
 
     # Token & cost summary
     total_tokens = total_input_tokens + total_output_tokens
@@ -256,6 +333,7 @@ def run_agent(input_path: str, output_path: str, limit: int | None, api_key: str
     print("\n" + "=" * 60)
     print(f"Processed : {total} posts")
     print(f"Relevant  : {relevant_count} posts  ({relevant_count / total * 100:.1f}%)")
+    print(f"Errors    : {error_count} posts skipped due to errors")
     print(f"Exported  : {final_output_path}  ({total} rows total)")
     print("-" * 60)
     print(f"Tokens used  : {total_input_tokens:,} input  +  {total_output_tokens:,} output  =  {total_tokens:,} total")
@@ -292,13 +370,3 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of posts to process (default: all).",
     )
     return parser.parse_args()
-
-
-if __name__ == "__main__":
-    args = parse_args()
-    run_agent(
-        input_path=args.input,
-        output_path=args.output,
-        limit=args.limit,
-        api_key=os.environ.get("GEMINI_API_KEY"),
-    )
