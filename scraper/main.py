@@ -1,12 +1,3 @@
-"""
-main.py
-=======
-Runs the full pipeline using the existing files:
-  1. data_ingest_test.py    — streams Bluesky for 60s, saves bluesky_stream_data.csv
-  2. Filter_CSV.py          — keyword-filters that CSV, saves filtered_output.csv
-  3. Filter_Agent.py        — AI classifies filtered posts, saves classified_posts.csv
-"""
-
 import asyncio
 from data_ingest import stream_continuous
 from Filter_CSV import filter_csv, OUTPUT_FILE

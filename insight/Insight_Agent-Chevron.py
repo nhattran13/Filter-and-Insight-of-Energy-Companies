@@ -1,24 +1,3 @@
-"""
-Iran Insight Agent
-==================
-Reads classified_posts.csv, filters to Relevant == True posts, then sends
-posts to Gemini in batches of 3. Each post is analysed for 3 outputs:
-    1. War_State          — current state of the Iran conflict in this post
-    2. Oil_Supply_Chain   — oil supply chain status signals in this post
-    3. Energy_Companies   — motions of other energy companies in this post
-
-After all batches are processed, one final conclusion call synthesises
-everything into a single intelligence finding printed to stdout.
-
-All per-post results are saved to a single timestamped CSV.
-Token usage and estimated cost are printed at the end.
-
-Usage:
-
-Dependencies:
-    pip install pandas google-genai
-"""
-
 import argparse
 import csv
 import json

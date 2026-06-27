@@ -1,24 +1,3 @@
-"""
-main.py
-=======
-Runs two Insight Agent scripts simultaneously, one for Chevron and one
-for ExxonMobil, both reading from the same classified_posts.csv.
-
-Each script runs as a separate subprocess in its own thread, so both
-execute in parallel rather than one after another.
-
-NOTE on input():
-Both Insight_Agent scripts call input() at startup to collect an optional
-system prompt addition. Since two subprocesses cannot share one terminal's
-stdin cleanly, this script reads ONE shared context string from the user
-up front, then passes it to both subprocesses non-interactively via the
---context flag (see "--context" in parse_args() inside each Insight_Agent
-script). This avoids stdin collisions between the two parallel processes.
-
-Usage:
-    python main.py --input classified_posts.csv --api-key YOUR_GEMINI_KEY
-"""
-
 import argparse
 import os
 import subprocess
