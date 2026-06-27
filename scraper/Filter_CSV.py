@@ -9,7 +9,7 @@ import re
 # TODO: Insert your CSV file name/path here when switching to a new file.
 # Example: INPUT_FILE = "bluesky_stream_data.csv"
 #          INPUT_FILE = "/path/to/your/file.csv"
-INPUT_FILE = "bluesky_historical_data on Feb 28, 2026.csv"  # <-- INSERT FILE NAME HERE
+INPUT_FILE = "bluesky_stream_data.csv"  # <-- INSERT FILE NAME HERE
 
 OUTPUT_FOLDER = "CSV_Files"
 OUTPUT_FILE = os.path.join(OUTPUT_FOLDER, "filtered_output.csv")

@@ -1,0 +1,25 @@
+services:
+  bluesky-pipeline:
+    build: ./scraper
+    env_file:
+      - .env                        # loads GEMINI_API_KEY automatically
+    environment:
+      - PYTHONUNBUFFERED=1          # ensures real-time logging
+    volumes:
+      - ./CSV_Files:/app/CSV_Files     # CSV files written here on your host machine
+      
+  insight:
+    build: ./insight
+    stdin_open: true
+    tty: true
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./CSV_Files:/app/CSV_Files     # same host folder mounted here too
+      - ./output:/app/Final_Assessment
+    command: ["python", "-u", "main.py"]
+    depends_on:
+     bluesky-pipeline:
+        condition: service_completed_successfully
